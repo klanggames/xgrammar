@@ -17,6 +17,7 @@ from xgrammar.builtin_structural_tag import (
     get_deepseek_v3_2_structural_tag,
     get_deepseek_v4_1_structural_tag,
     get_deepseek_v4_structural_tag,
+    get_gemma_4_structural_tag,
     get_glm_4_7_structural_tag,
     get_harmony_structural_tag,
     get_kimi_k3_structural_tag,
@@ -39,7 +40,7 @@ from xgrammar.structural_tag import (
     StructuralTag,
     TagFormat,
 )
-from xgrammar.testing import _is_grammar_accept_string
+from xgrammar.testing import _get_masked_tokens_from_bitmask, _is_grammar_accept_string
 
 
 def _input_dict_to_get_stag_kwargs(format_type: str, input_dict: Dict[str, Any]) -> Dict[str, Any]:
@@ -279,6 +280,7 @@ def test_reasoning_boolean_aliases(boolean_value: bool, mode: Literal["enabled",
         "minimax",
         "minimax_m3",
         "glm_4_7",
+        "gemma_4",
         "deepseek_v4",
         "deepseek_v4_1",
         "cohere",
@@ -1427,6 +1429,7 @@ def test_qwen_reasoning_suffix_stays_inside_the_optional_prefix(model: str):
         get_minimax_structural_tag,
         get_glm_4_7_structural_tag,
         get_cohere_structural_tag,
+        get_gemma_4_structural_tag,
     ],
 )
 @pytest.mark.parametrize(
@@ -1499,6 +1502,154 @@ def test_specific_functions_cases(structural_tag_fn, case: Dict[str, Any]):
     assert isinstance(structural_tag, StructuralTag)
     xgr.Grammar.from_structural_tag(structural_tag)
     assert None not in _collect_json_schema_values(structural_tag)
+
+
+# ---------- Test: gemma_4 ----------
+
+_GEMMA_4_SCHEMA = {
+    "type": "object",
+    "properties": {"location": {"type": "string"}},
+    "required": ["location"],
+}
+_tools_gemma_4 = make_tools(["get_weather"], _GEMMA_4_SCHEMA)
+_tools_gemma_4_pair = make_tools(["get_weather", "get_time"], _GEMMA_4_SCHEMA)
+
+_GEMMA_4_WEATHER_CALL = '<|tool_call>call:get_weather{location:<|"|>Beijing<|"|>}<tool_call|>'
+_GEMMA_4_TIME_CALL = '<|tool_call>call:get_time{location:<|"|>Beijing<|"|>}<tool_call|>'
+
+_gemma_4_auto_instances = [
+    pytest.param("Sure, one moment.", True, id="plain-text"),
+    pytest.param(_GEMMA_4_WEATHER_CALL, True, id="single-call"),
+    pytest.param("Let me check. " + _GEMMA_4_WEATHER_CALL, True, id="text-then-call"),
+    # Gemma 4 delimits strings with <|"|> and leaves keys bare; the JSON form is not its syntax.
+    pytest.param(
+        '<|tool_call>call:get_weather{"location":"Beijing"}<tool_call|>', False, id="json-quoted"
+    ),
+    pytest.param(
+        '<|tool_call>call:get_altitude{location:<|"|>Beijing<|"|>}<tool_call|>',
+        False,
+        id="unknown-tool",
+    ),
+]
+
+
+@pytest.mark.parametrize("instance, is_accepted", _gemma_4_auto_instances)
+def test_gemma_4_auto_instances(instance: str, is_accepted: bool):
+    """gemma_4 auto mode: free text that may dispatch into <|tool_call> blocks."""
+
+    structural_tag = get_model_structural_tag(
+        "gemma_4", tools=_tools_gemma_4, tool_choice="auto", reasoning="disabled"
+    )
+    check_stag_with_instance(structural_tag, instance, is_accepted)
+
+
+def test_gemma_4_required_tool_choice():
+    """required forces at least one call and still admits parallel calls."""
+
+    structural_tag = get_model_structural_tag(
+        "gemma_4", tools=_tools_gemma_4_pair, tool_choice="required", reasoning="disabled"
+    )
+    check_stag_with_instance(structural_tag, _GEMMA_4_WEATHER_CALL, True)
+    check_stag_with_instance(structural_tag, "Sure, one moment.", False)
+    check_stag_with_instance(structural_tag, _GEMMA_4_WEATHER_CALL + _GEMMA_4_TIME_CALL, True)
+
+
+def test_gemma_4_forced_tool_choice_pins_the_named_tool():
+    """forced admits only the resolved tool."""
+
+    structural_tag = get_model_structural_tag(
+        "gemma_4",
+        tools=_tools_gemma_4_pair,
+        tool_choice={"type": "function", "function": {"name": "get_weather"}},
+        reasoning="disabled",
+    )
+    check_stag_with_instance(structural_tag, _GEMMA_4_WEATHER_CALL, True)
+    check_stag_with_instance(structural_tag, _GEMMA_4_TIME_CALL, False)
+
+
+def test_gemma_4_tool_without_parameters_still_requires_braces():
+    """A tool with no schema keeps its braces: without them the name absorbs the block."""
+
+    structural_tag = get_model_structural_tag(
+        "gemma_4",
+        tools=[{"function": {"name": "ping", "parameters": None}}],
+        tool_choice="required",
+        reasoning="disabled",
+    )
+    check_stag_with_instance(structural_tag, "<|tool_call>call:ping{}<tool_call|>", True)
+    check_stag_with_instance(structural_tag, "<|tool_call>call:ping5<tool_call|>", False)
+
+
+def test_gemma_4_reasoning_channel_blocks_tool_calls():
+    """The thought channel is free text, so a tool call may only start after it closes."""
+
+    structural_tag = get_model_structural_tag("gemma_4", tools=_tools_gemma_4, reasoning="enabled")
+    check_stag_with_instance(
+        structural_tag, "<|channel>thought\nhmm<channel|>" + _GEMMA_4_WEATHER_CALL, True
+    )
+    check_stag_with_instance(
+        structural_tag, "<|channel>thought\nhmm <|tool_call> now<channel|>done", False
+    )
+
+
+def test_gemma_4_single_token_delimiter_walk():
+    """Gemma 4's markers are single vocabulary entries in the real tokenizer.
+
+    Walk a whole tool call token by token against a vocabulary where <|tool_call> and
+    <|"|> are one token each, so the grammar is exercised through token matching rather
+    than the byte-level string checks above.
+    """
+
+    vocab = [
+        "<|tool_call>",
+        "<tool_call|>",
+        '<|"|>',
+        "call",
+        ":",
+        "get_weather",
+        "{",
+        "}",
+        "ci",
+        "ty",
+        "Seoul",
+        "<eos>",
+    ]
+    tokenizer_info = xgr.TokenizerInfo(vocab, stop_token_ids=[vocab.index("<eos>")])
+    tools = make_tools(
+        ["get_weather"],
+        {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]},
+    )
+    structural_tag = get_model_structural_tag(
+        "gemma_4", tools=tools, tool_choice="required", reasoning="disabled"
+    )
+    compiler = xgr.GrammarCompiler(tokenizer_info, cache_enabled=False)
+    matcher = xgr.GrammarMatcher(compiler.compile_structural_tag(structural_tag))
+    bitmask = xgr.allocate_token_bitmask(1, tokenizer_info.vocab_size)
+
+    def walk(*pieces: str) -> None:
+        for piece in pieces:
+            matcher.fill_next_token_bitmask(bitmask)
+            token_id = vocab.index(piece)
+            rejected = _get_masked_tokens_from_bitmask(bitmask, len(vocab))
+            assert token_id not in rejected, f"bitmask rejects {piece!r}"
+            assert matcher.accept_token(token_id), f"matcher rejected {piece!r}"
+
+    walk("<|tool_call>", "call", ":", "get_weather", "{", "ci")
+    # Mid-key only the rest of the key may follow: neither the delimiter that would open
+    # a string value nor the colon that would close the key is legal yet.
+    matcher.fill_next_token_bitmask(bitmask)
+    rejected = _get_masked_tokens_from_bitmask(bitmask, len(vocab))
+    assert set(range(len(vocab))) - set(rejected) == {vocab.index("ty")}
+
+    walk("ty", ":", '<|"|>')
+    # Either marker inside the string body would desync every downstream parser.
+    matcher.fill_next_token_bitmask(bitmask)
+    rejected = _get_masked_tokens_from_bitmask(bitmask, len(vocab))
+    assert vocab.index("<|tool_call>") in rejected
+    assert vocab.index("<tool_call|>") in rejected
+
+    walk("Seoul", '<|"|>', "}", "<tool_call|>", "<eos>")
+    assert matcher.is_terminated()
 
 
 # ---------- Test: exclude_special_tokens ----------
@@ -2401,6 +2552,12 @@ _REQUIRED_TERMINATION_CASES = [
         '<tool_call>{"name": "get_weather", "arguments": {"location": "Beijing"}}</tool_call>'
         '<tool_call>{"name": "get_time", "arguments": {"timezone": "UTC"}}</tool_call>',
     ),
+    (
+        "gemma_4",
+        '<|tool_call>call:get_weather{location:<|"|>Beijing<|"|>}<tool_call|>',
+        '<|tool_call>call:get_weather{location:<|"|>Beijing<|"|>}<tool_call|>'
+        '<|tool_call>call:get_time{timezone:<|"|>UTC<|"|>}<tool_call|>',
+    ),
 ]
 
 
@@ -2545,6 +2702,7 @@ _ANY_ORDER_MODELS = [
     "glm_4_7",
     "harmony",
     "exaone",
+    "gemma_4",
 ]
 
 

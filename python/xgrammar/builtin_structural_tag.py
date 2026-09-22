@@ -2306,10 +2306,8 @@ def get_glm_4_7_structural_tag(
     return _assemble_structural_tag(prefix_tag, suffix_tag)
 
 
-# TODO: We are dropping Gemma support because its parameter format is special and not supported
-# yet: the string are wrapped by <|"|> instead of ". We will support it later and get it back.
-# @register_model_structural_tag("gemma_4")
-def _get_gemma_4_structural_tag(
+@register_model_structural_tag("gemma_4")
+def get_gemma_4_structural_tag(
     tools: Optional[List[FunctionToolParam]] = None,
     builtin_tools: Optional[List[BuiltinToolParam]] = None,
     tool_choice: Literal["auto", "required", "forced"] = "auto",
@@ -2340,8 +2338,9 @@ def _get_gemma_4_structural_tag(
       ``function`` object containing ``name`` and ``parameters`` fields.
     - ``reasoning``: controls whether the reasoning channel is required,
       omitted, or optional.
-    - ``tool_choice``: ``"auto"`` or ``"required"``. ``"required"`` forces at
-      least one tool call.
+    - ``tool_choice``: ``"auto"``, ``"required"``, or ``"forced"``.
+      ``"required"`` forces at least one tool call; ``"forced"`` forces the
+      single resolved tool.
 
     Supported models:
 
@@ -2361,76 +2360,65 @@ def _get_gemma_4_structural_tag(
     TOOL_CALL_TRIGGER = "<|tool_call>"
     THINK_TAG_BEGIN = "<|channel>thought\n"
     THINK_TAG_END = "<channel|>"
-    GEMMA4_EXCLUDE_TOKENS = ["<|channel>", "<channel|>"]
+    GEMMA_STYLE = "gemma"
+    # <|tool_call> is deliberately absent here: it is the trigger of the triggered-text
+    # span, and excluding it would remove the dispatch into the tool-call tags.
+    TEXT_EXCLUDE_TOKENS = ["<|channel>", "<channel|>"]
+    # The thought channel and the no-tools free text are unconstrained prose, so a tool
+    # call must not start there.
+    REASONING_EXCLUDE_TOKENS = TEXT_EXCLUDE_TOKENS + [TOOL_CALL_TRIGGER]
 
-    tools = tools or []
-    builtin_tools = builtin_tools or []
-    if tool_choice == "auto":
-        tags = []
-        for tool in tools:
-            function = tool.function
-            parameters = _get_function_parameters(function)
-            name = function.name
-            tags.append(
-                TagFormat(
-                    begin=TOOL_CALL_BEGIN_PREFIX + name,
-                    content=JSONSchemaFormat(
-                        json_schema=parameters,
-                        any_order=any_order,
-                        max_whitespace_cnt=max_whitespace_cnt,
-                    ),
-                    end=TOOL_CALL_END,
-                )
+    def _make_call_tag(function: FunctionDefinition) -> TagFormat:
+        # <|tool_call>call:NAME{arguments}<tool_call|>
+        parameters = _get_function_parameters(function)
+        if not isinstance(parameters, dict) or parameters.get("type") != "object":
+            # In gemma style the braces are part of the argument grammar, so a schema
+            # that constrains nothing also admits a brace-less block, which the parser
+            # reads as a longer tool name with no arguments. Supply the braces here.
+            return TagFormat(
+                begin=f"{TOOL_CALL_BEGIN_PREFIX}{function.name}{{",
+                content=AnyTextFormat(excludes=[TOOL_CALL_TRIGGER, TOOL_CALL_END]),
+                end=f"}}{TOOL_CALL_END}",
             )
-
-        if len(tags) > 0:
-            suffix_tag = TriggeredTagsFormat(
-                triggers=[TOOL_CALL_TRIGGER],
-                tags=tags,
-                excludes=_text_excludes(exclude_special_tokens, GEMMA4_EXCLUDE_TOKENS),
-                stop_after_first=not parallel_tool_calls,
-            )
-        else:
-            suffix_tag = AnyTextFormat(
-                excludes=_text_excludes(exclude_special_tokens, GEMMA4_EXCLUDE_TOKENS)
-            )
-
-    elif tool_choice == "forced":
-        if not tools:
-            raise ValueError("Forced tool choice must resolve to exactly one tool.")
-        function = tools[0].function
-        suffix_tag = TagFormat(
+        return TagFormat(
             begin=TOOL_CALL_BEGIN_PREFIX + function.name,
             content=JSONSchemaFormat(
-                json_schema=_get_function_parameters(function),
+                json_schema=parameters,
+                style=GEMMA_STYLE,
                 any_order=any_order,
                 max_whitespace_cnt=max_whitespace_cnt,
             ),
             end=TOOL_CALL_END,
         )
 
-    elif tool_choice == "required":
-        tags = []
-        for tool in tools:
-            function = tool.function
-            parameters = _get_function_parameters(function)
-            name = function.name
-            tags.append(
-                TagFormat(
-                    begin=TOOL_CALL_BEGIN_PREFIX + name,
-                    content=JSONSchemaFormat(
-                        json_schema=parameters,
-                        any_order=any_order,
-                        max_whitespace_cnt=max_whitespace_cnt,
-                    ),
-                    end=TOOL_CALL_END,
-                )
+    tools = tools or []
+    builtin_tools = builtin_tools or []
+    if tool_choice == "auto":
+        tags = [_make_call_tag(tool.function) for tool in tools]
+        if len(tags) > 0:
+            suffix_tag = TriggeredTagsFormat(
+                triggers=[TOOL_CALL_TRIGGER],
+                tags=tags,
+                excludes=_text_excludes(exclude_special_tokens, TEXT_EXCLUDE_TOKENS),
+                stop_after_first=not parallel_tool_calls,
             )
+        else:
+            suffix_tag = AnyTextFormat(
+                excludes=_text_excludes(exclude_special_tokens, REASONING_EXCLUDE_TOKENS)
+            )
+
+    elif tool_choice == "forced":
+        if not tools:
+            raise ValueError("Forced tool choice must resolve to exactly one tool.")
+        suffix_tag = _make_call_tag(tools[0].function)
+
+    elif tool_choice == "required":
+        tags = [_make_call_tag(tool.function) for tool in tools]
         assert len(tags) > 0
         suffix_tag = TriggeredTagsFormat(
             triggers=[TOOL_CALL_TRIGGER],
             tags=tags,
-            excludes=_text_excludes(exclude_special_tokens, GEMMA4_EXCLUDE_TOKENS),
+            excludes=_text_excludes(exclude_special_tokens, TEXT_EXCLUDE_TOKENS),
             at_least_one=True,
             stop_after_first=not parallel_tool_calls,
         )
@@ -2440,7 +2428,7 @@ def _get_gemma_4_structural_tag(
         think_tag_begin=THINK_TAG_BEGIN,
         think_tag_end=THINK_TAG_END,
         exclude_special_tokens=exclude_special_tokens,
-        reasoning_exclude_tokens=GEMMA4_EXCLUDE_TOKENS,
+        reasoning_exclude_tokens=REASONING_EXCLUDE_TOKENS,
         prompt_end_with_think=False,
     )
     return _assemble_structural_tag(prefix_tag, suffix_tag)

@@ -1,9 +1,10 @@
 """Validate builtin structural tags against official model renderers.
 
-Uses tokenizer.apply_chat_template (or encoding scripts for DeepSeek V3.2/V4/V4.1)
-and Cohere Melody for CMD5 to render model outputs, then checks that xgrammar
-structural tag grammars accept them. Requires encoding_dsv32.py and
-encoding_dsv4.py in the same directory. V4.1 uses a revision-pinned official encoder.
+Uses tokenizer.apply_chat_template (or encoding scripts for DeepSeek V3.2/V4/V4.1
+and Gemma 4) and Cohere Melody for CMD5 to render model outputs, then checks that
+xgrammar structural tag grammars accept them. Requires encoding_dsv32.py,
+encoding_dsv4.py and encoding_gemma4.py in the same directory. V4.1 uses a
+revision-pinned official encoder.
 """
 
 import importlib.util
@@ -75,7 +76,6 @@ PARALLEL_TOOL_SCENARIOS = [(2, "auto", 2), (2, "required", 2)]
 # (stag_key, model_id, reasoning, template_kwargs)
 # Excluded:
 #   - Llama-4: pythonic tool call format, needs separate structural tag
-#   - gemma_4: tool calls use <|"|> quoting, not JSON
 #   - deepseek_r1 thinking=True: template drops <think> in history rendering,
 #     prompt diff extraction doesn't work
 #   - Kimi-K2-Thinking thinking=False: model always outputs <think></think>,
@@ -124,11 +124,18 @@ MODEL_CONFIGS = [
         False,
         {"skip_think": True, "enable_thinking": False},
     ),
+    ("gemma_4", "ENCODER:gemma4", True, {"enable_thinking": True}),
+    ("gemma_4", "ENCODER:gemma4", False, {"enable_thinking": False}),
 ]
 
 # Models whose renderer cannot produce a turn with an empty reasoning block: the DeepSeek
 # V3.2 encoder rejects it, the other templates drop the block entirely.
-SKIP_EMPTY_REASONING = {"ENCODER:dsv32", "MiniMaxAI/MiniMax-M2.5", "moonshotai/Kimi-K3"}
+SKIP_EMPTY_REASONING = {
+    "ENCODER:dsv32",
+    "ENCODER:gemma4",
+    "MiniMaxAI/MiniMax-M2.5",
+    "moonshotai/Kimi-K3",
+}
 
 # Models where tool call format in template doesn't match structural tag.
 SKIP_TOOLS = set()
@@ -168,6 +175,8 @@ EOS_SUFFIXES = {
     "deepseek_v4_1": ["<｜end▁of▁sentence｜>"],
     "cohere": ["<|END_OF_TURN_TOKEN|>"],
     "exaone": ["[|endofturn|]"],
+    # A turn ending in tool calls is closed by <|tool_response>, not <turn|>.
+    "gemma_4": ["<turn|>", "<|tool_response>"],
 }
 
 
@@ -287,7 +296,24 @@ def load_deepseek_v41_encoder():
     return module
 
 
+def extract_output_gemma4(assistant_msg, tools, template_kwargs):
+    from encoding_gemma4 import encode_messages
+
+    enable_thinking = template_kwargs["enable_thinking"]
+    prompt = encode_messages(
+        [USER_MSG], tools=tools, enable_thinking=enable_thinking, add_generation_prompt=True
+    )
+    full = encode_messages([USER_MSG, assistant_msg], tools=tools, enable_thinking=enable_thinking)
+    assert full.startswith(prompt), (
+        f"Full does not start with prompt.\nprompt[-200:]={repr(prompt[-200:])}\n"
+        f"full[:len(prompt)+200]={repr(full[: len(prompt) + 200])}"
+    )
+    return strip_eos(full[len(prompt) :], "gemma_4")
+
+
 def extract_output_encoder(encoder_name, stag_key, assistant_msg, tools, template_kwargs):
+    if encoder_name == "gemma4":
+        return extract_output_gemma4(assistant_msg, tools, template_kwargs)
     if encoder_name == "dsv32":
         from encoding_dsv32 import encode_messages, eos_token
     elif encoder_name == "dsv41":
@@ -484,7 +510,8 @@ def make_test_param(case):
     if model_id.startswith("MELODY:"):
         if sys.version_info < (3, 10):
             marks.append(pytest.mark.skip(reason="cohere_melody requires Python >= 3.10"))
-    else:
+    elif model_id != "ENCODER:gemma4":
+        # Gemma 4 renders from the vendored chat template, so it needs no Hub access.
         marks.append(pytest.mark.hf_token_required)
     return pytest.param(case, id=case_id(case), marks=marks)
 
@@ -560,6 +587,123 @@ def test_minimax_m3_recursive_tool_arguments_alignment():
         "minimax_m3", "MiniMaxAI/MiniMax-M3", assistant_msg, tools, {"thinking_mode": "disabled"}
     )
     validate_output("minimax_m3", tools, "required", "disabled", model_output)
+
+
+def test_gemma_4_nested_tool_arguments_alignment():
+    """Bare keys nest recursively in Gemma 4 arguments, and numbers stay unquoted."""
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "create_order",
+                "description": "Create an order.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "nights": {"type": "integer"},
+                        "shipping": {
+                            "type": "object",
+                            "properties": {"city": {"type": "string"}, "zip": {"type": "integer"}},
+                            "required": ["city", "zip"],
+                        },
+                        "tags": {"type": "array", "items": {"type": "string"}},
+                    },
+                    "required": ["nights", "shipping", "tags"],
+                },
+            },
+        }
+    ]
+    assistant_msg = {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+            {
+                "type": "function",
+                "id": "call_0",
+                "function": {
+                    "name": "create_order",
+                    "arguments": {
+                        "nights": 2,
+                        "shipping": {"city": "Beijing", "zip": 100000},
+                        "tags": ["gift", "fragile"],
+                    },
+                },
+            }
+        ],
+    }
+    model_output = extract_output_gemma4(assistant_msg, tools, {"enable_thinking": False})
+    assert model_output == (
+        '<|tool_call>call:create_order{nights:2,shipping:{city:<|"|>Beijing<|"|>,zip:100000},'
+        'tags:[<|"|>gift<|"|>,<|"|>fragile<|"|>]}<tool_call|>'
+    )
+    validate_output("gemma_4", tools, "required", False, model_output)
+
+
+@pytest.mark.parametrize(
+    "properties, arguments, rendered_arguments",
+    (
+        pytest.param(
+            {"zeta": {"type": "string"}, "mid": {"type": "string"}, "alpha": {"type": "string"}},
+            {"zeta": "Z", "mid": "M", "alpha": "A"},
+            'alpha:<|"|>A<|"|>,mid:<|"|>M<|"|>,zeta:<|"|>Z<|"|>',
+            id="reordered",
+        ),
+        pytest.param(
+            {"Zeta": {"type": "string"}, "alpha": {"type": "string"}, "beta": {"type": "string"}},
+            {"Zeta": "Z", "alpha": "A", "beta": "B"},
+            'alpha:<|"|>A<|"|>,beta:<|"|>B<|"|>,Zeta:<|"|>Z<|"|>',
+            id="reordered-case-insensitive",
+        ),
+        pytest.param(
+            {
+                "config": {
+                    "type": "object",
+                    "properties": {"z": {"type": "string"}, "a": {"type": "string"}},
+                    "required": ["z", "a"],
+                }
+            },
+            {"config": {"z": "Z", "a": "A"}},
+            'config:{a:<|"|>A<|"|>,z:<|"|>Z<|"|>}',
+            id="reordered-nested",
+        ),
+        pytest.param(
+            {"query": {"type": "string"}},
+            {"query": 'find {x, y} "now"\nplease'},
+            'query:<|"|>find {x, y} "now"\nplease<|"|>',
+            id="punctuation-in-string",
+        ),
+    ),
+)
+def test_gemma_4_argument_rendering_alignment(properties, arguments, rendered_arguments):
+    """Gemma 4 renders arguments in dictsort order, and strings hold raw punctuation."""
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "set_values",
+                "description": "Set values.",
+                "parameters": {
+                    "type": "object",
+                    "properties": properties,
+                    "required": list(properties),
+                },
+            },
+        }
+    ]
+    assistant_msg = {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+            {
+                "type": "function",
+                "id": "call_0",
+                "function": {"name": "set_values", "arguments": arguments},
+            }
+        ],
+    }
+    model_output = extract_output_gemma4(assistant_msg, tools, {"enable_thinking": False})
+    assert model_output == f"<|tool_call>call:set_values{{{rendered_arguments}}}<tool_call|>"
+    validate_output("gemma_4", tools, "required", False, model_output)
 
 
 @pytest.mark.parametrize(

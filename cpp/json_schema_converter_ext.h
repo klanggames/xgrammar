@@ -298,6 +298,61 @@ class CohereXMLToolCallingConverter : public XMLToolCallingConverter {
   int cohere_array_level_ = 0;
 };
 
+/*!
+ * \brief Converter for Gemma tool call arguments.
+ *
+ * At every nesting level objects use bare keys ({key:value}), strings are delimited by
+ * <|"|> instead of the double quote and carry no escape sequences, and numbers, booleans,
+ * null, arrays and objects keep their JSON syntax.
+ */
+class GemmaToolCallingConverter : public JSONSchemaConverter {
+ public:
+  GemmaToolCallingConverter(
+      std::optional<int> indent,
+      std::optional<std::pair<std::string, std::string>> separators,
+      bool any_whitespace,
+      std::optional<int> max_whitespace_cnt,
+      RefResolver ref_resolver = nullptr,
+      bool any_order = false
+  );
+
+ protected:
+  int32_t GenerateString(const StringSpec& spec, const std::string& rule_name) override;
+
+  int32_t GenerateObject(
+      const ObjectSpec& spec, const std::string& rule_name, bool need_brace = true
+  ) override;
+
+  int32_t FormatPropertyKey(const std::string& key, const SchemaSpecPtr& schema) override;
+  std::string GetKeyPattern() const override;
+  int32_t GetKeyPatternExcluding(
+      const std::vector<ObjectSpec::Property>& properties, const std::string& rule_name
+  ) override;
+  int32_t GenerateConst(const ConstSpec& spec, const std::string& rule_name) override;
+  int32_t GenerateEnum(const EnumSpec& spec, const std::string& rule_name) override;
+
+  void AddBasicRules() override;
+
+ private:
+  // Emits a fixed JSON value in gemma syntax: delimited strings, bare and sorted object keys.
+  int32_t GenerateLiteral(const picojson::value& value);
+
+  struct BareKeyTrieNode {
+    bool is_terminal = false;
+    std::map<uint8_t, BareKeyTrieNode> children;
+  };
+
+  // Matches any bare key except the declared property names spelled out by the trie.
+  int32_t BuildBareKeyTrieBody(const BareKeyTrieNode& node, int depth);
+
+  // Replaces the JSON double quote around strings.
+  static const std::string kGemmaStringDelim;
+  // Rule matching any text that contains neither the string delimiter nor a tool-call marker.
+  static const std::string kGemmaStringContent;
+  // Rule matching a bare property key.
+  static const std::string kGemmaVariableName;
+};
+
 namespace converter_ext {
 
 XMLWrapper GetQwenXMLWrapper();

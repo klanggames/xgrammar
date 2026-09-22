@@ -41,6 +41,7 @@ class JSONSchemaFormat(BaseModel):
         "cohere_xml",
         "kimi_k3_xml",
         "deepseek_v4_1_xml",
+        "gemma",
     ] = "json"
     """How to parse the content. Valid values: \"json\" (standard JSON), \"qwen_xml\" (Qwen XML:
     <parameter=key>value</parameter>), \"minimax_xml\" (MiniMax XML:
@@ -50,12 +51,16 @@ class JSONSchemaFormat(BaseModel):
     \"deepseek_v4_1_xml\" (DeepSeek-V4.1: <{dsml_token} parameter name=\"key\" string=\"true|false\">value</{dsml_token} parameter>),
     \"glm_xml\" (GLM XML: <arg_key>key</arg_key><arg_value>value</arg_value>),
     \"cohere_xml\" (Cohere XML: <cofl:value name=\"key\" type=\"raw|json|dict|list\">value</cofl:value>),
-    \"kimi_k3_xml\" (Kimi-K3: <|open|>argument key=\"key\" type=\"type\"<|sep|>value<|close|>argument<|sep|>)."""
+    \"kimi_k3_xml\" (Kimi-K3: <|open|>argument key=\"key\" type=\"type\"<|sep|>value<|close|>argument<|sep|>),
+    \"gemma\" (Gemma 4 tool-call arguments: JSON-shaped with bare keys and strings delimited by
+    <|\"|> instead of quotes, so string bodies carry no escapes)."""
     any_order: bool = False
     """Whether object properties may appear in any order.
 
     - False (default): properties follow the schema's declared order, fully validated (required
-      keys present, no duplicates).
+      keys present, no duplicates). ``style="gemma"`` orders them the way the chat template's
+      ``dictsort`` does (case-insensitive by key) instead, and accepts keys admitted by
+      ``additionalProperties`` only after the declared ones.
     - True: properties may appear in any order; only key validity and each key's value schema are
       enforced. Key presence and uniqueness are not checked, so required keys may be missing and
       keys may repeat. The entry count is bounded to ``[max(minProperties, n_required),

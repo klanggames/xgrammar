@@ -1106,6 +1106,74 @@ def test_json_schema_style_kimi_k3_xml_const_enum_and_nullable_values():
     )
 
 
+# JSONSchemaFormat with style="gemma" ({key:<|"|>value<|"|>,n:3})
+#
+# Gemma 4 renders tool-call arguments as a JSON-shaped object with bare keys, and delimits
+# strings with <|"|> instead of quotes, so string bodies carry no escapes.
+gemma_instance_is_accepted = [
+    ('{age:100,name:<|"|>Bob<|"|>}', True),
+    # Whitespace around keys, colons and commas is tolerated.
+    ('{ age : 100 , name : <|"|>Bob<|"|> }', True),
+    # Plain JSON is not accepted: keys are bare and strings use the delimiters.
+    ('{"age":100,"name":"Bob"}', False),
+    # Properties must follow the order the chat template's dictsort renders them in.
+    ('{name:<|"|>Bob<|"|>,age:100}', False),
+    # Missing required property.
+    ('{name:<|"|>Bob<|"|>}', False),
+]
+
+
+@pytest.mark.parametrize("instance, is_accepted", gemma_instance_is_accepted)
+def test_json_schema_style_gemma_format(instance: str, is_accepted: bool):
+    """Test JSONSchemaFormat with style='gemma'."""
+    stag_format = {
+        "type": "json_schema",
+        "json_schema": {
+            "type": "object",
+            "properties": {"name": {"type": "string"}, "age": {"type": "integer"}},
+            "required": ["name", "age"],
+        },
+        "style": "gemma",
+    }
+    structural_tag = {"type": "structural_tag", "format": stag_format}
+    stag_grammar = xgr.Grammar.from_structural_tag(structural_tag)
+    assert '<|\\"|>' in str(stag_grammar)
+
+    check_stag_with_instance(stag_format, instance, is_accepted)
+
+
+def test_json_schema_style_gemma_empty_object():
+    """style='gemma' with no properties accepts an empty object."""
+    stag_format = {
+        "type": "json_schema",
+        "json_schema": {"type": "object", "properties": {}},
+        "style": "gemma",
+    }
+    check_stag_with_instance(stag_format, "{}", True)
+
+
+def test_json_schema_style_gemma_inside_tag():
+    """style='gemma' as the content of a Gemma 4 tool-call tag."""
+    stag = StructuralTag(
+        format=TagFormat(
+            begin="<|tool_call>call:get_weather",
+            content=JSONSchemaFormat(
+                json_schema={
+                    "type": "object",
+                    "properties": {"q": {"type": "string"}},
+                    "required": ["q"],
+                },
+                style="gemma",
+            ),
+            end="<tool_call|>",
+        )
+    )
+    check_stag_with_instance(
+        stag, '<|tool_call>call:get_weather{q:<|"|>Paris<|"|>}<tool_call|>', True
+    )
+    check_stag_with_instance(stag, '<|tool_call>call:get_weather{"q":"Paris"}<tool_call|>', False)
+
+
 def test_json_schema_style_minimax_m3_xml_fixed_nested_values():
     namespace = "]<]minimax[>["
 
@@ -3286,7 +3354,7 @@ json_format_error_test_data = [
     ),
     (
         '{"type": "structural_tag", "format": {"type": "json_schema", "json_schema": {"type": "string"}, "style": "not_string"}}',
-        'style must be "json", "qwen_xml", "minimax_xml", "minimax_m3_xml", "deepseek_xml", "glm_xml", "cohere_xml", "kimi_k3_xml", or "deepseek_v4_1_xml"',
+        'style must be "json", "qwen_xml", "minimax_xml", "minimax_m3_xml", "deepseek_xml", "glm_xml", "cohere_xml", "kimi_k3_xml", "deepseek_v4_1_xml", or "gemma"',
     ),
     # RepeatFormat Errors - illegal min/max
     (
